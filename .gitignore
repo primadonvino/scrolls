@@ -1,0 +1,49 @@
+# Local app secrets
+Config/Secrets.xcconfig
+*.p8
+AuthKey_*.p8
+
+# Xcode / Swift build output
+DerivedData/
+build/
+.build/
+*.xcarchive/
+*.dSYM/
+*.ipa
+*.xcresult
+
+# Xcode user-local state
+*.xcuserstate
+*.xcscmblueprint
+*.moved-aside
+*.pbxuser
+*.perspectivev3
+*.mode1v3
+*.mode2v3
+xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+
+# Local logs and generated reports
+logs/
+*.log
+*.tmp
+*.swp
+*.DS_Store
+
+# App Store / review export artifacts
+appstore_screenshots_exports/
+review-assets/
+
+# Local archive snapshots
+archives/
+*.tar.gz
+*.tgz
+*.zip
+*.sha256
+
+# Supabase local runtime/cache
+supabase/.temp/
+
+# Generated media/storage scratch
+supabase/storage/
