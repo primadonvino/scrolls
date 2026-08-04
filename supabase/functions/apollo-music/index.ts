@@ -14,10 +14,32 @@ import {
 
 type JsonRecord = Record<string, unknown>;
 
+type MediaReference = {
+  provider: string;
+  bucket: string | null;
+  objectKey: string;
+  mimeType: string | null;
+  byteSize: number | null;
+};
+
+type NormalizedTrack = {
+  title: string;
+  trackNumber: number;
+  durationSeconds: number | null;
+  bpm: number | null;
+  musicalKey: string | null;
+  explicit: boolean;
+  isrc: string | null;
+  lyrics: string | null;
+  credits: unknown[];
+  asset: MediaReference;
+};
+
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RELEASE_TYPES = new Set(["single", "ep", "album"]);
 const RELEASE_STATUSES = new Set(["draft", "published"]);
 const PLAY_SOURCES = new Set(["web", "ios", "android", "daw"]);
+const RELEASE_SOURCES = new Set(["apollo-daw", "apollo-ios"]);
 
 Deno.serve((req) => withRequestLogging(req, async (log) => {
   if (req.method === "OPTIONS") return optionsResponse();
@@ -69,6 +91,17 @@ function integerOrNull(value: unknown): number | null {
   return parsed === null ? null : Math.max(0, Math.round(parsed));
 }
 
+function booleanValue(value: unknown, fallback = false): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes"].includes(normalized)) return true;
+    if (["false", "0", "no"].includes(normalized)) return false;
+  }
+  return fallback;
+}
+
 function uuid(value: unknown): string | null {
   const normalized = String(value ?? "").trim().toLowerCase();
   return UUID_PATTERN.test(normalized) ? normalized : null;
@@ -94,13 +127,7 @@ function releaseStatus(value: unknown): "draft" | "published" {
   return RELEASE_STATUSES.has(normalized) ? normalized as "draft" | "published" : "published";
 }
 
-function mediaRef(value: unknown): {
-  provider: string;
-  bucket: string | null;
-  objectKey: string;
-  mimeType: string | null;
-  byteSize: number | null;
-} | null {
+function mediaRef(value: unknown): MediaReference | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as JsonRecord;
   const objectKey = text(record.objectKey ?? record.object_key, 512);
@@ -114,31 +141,94 @@ function mediaRef(value: unknown): {
   };
 }
 
+function normalizeTracks(payload: JsonRecord, ownerID: string): NormalizedTrack[] | Response {
+  const rawTracks = Array.isArray(payload.tracks)
+    ? payload.tracks
+    : [{
+      title: payload.trackTitle ?? payload.track_title ?? payload.title,
+      trackNumber: 1,
+      durationSeconds: payload.durationSeconds ?? payload.duration_seconds,
+      bpm: payload.bpm,
+      musicalKey: payload.musicalKey ?? payload.musical_key,
+      explicit: payload.explicit,
+      asset: payload.track ?? payload.trackAsset ?? payload.track_asset,
+    }];
+
+  if (rawTracks.length < 1 || rawTracks.length > 100) {
+    return badRequest("A release requires between 1 and 100 tracks.");
+  }
+
+  const ownerPrefix = `music/${ownerID.toLowerCase()}/`;
+  const usedTrackNumbers = new Set<number>();
+  const tracks: NormalizedTrack[] = [];
+
+  for (let index = 0; index < rawTracks.length; index += 1) {
+    const raw = rawTracks[index];
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return badRequest(`Track ${index + 1} is invalid.`);
+    }
+    const record = raw as JsonRecord;
+    const title = text(record.title, 160);
+    const asset = mediaRef(record.asset ?? record.track ?? record.trackAsset ?? record.track_asset);
+    if (!title) return badRequest(`Track ${index + 1} requires a title.`);
+    if (!asset) return badRequest(`Track ${index + 1} requires a master asset.`);
+    if (!asset.objectKey.startsWith(ownerPrefix)) {
+      return badRequest(`Track ${index + 1} is outside the signed-in user's namespace.`);
+    }
+
+    const trackNumber = integerOrNull(record.trackNumber ?? record.track_number) ?? index + 1;
+    if (trackNumber < 1 || trackNumber > 999 || usedTrackNumbers.has(trackNumber)) {
+      return badRequest(`Track ${index + 1} has an invalid or duplicate track number.`);
+    }
+    usedTrackNumbers.add(trackNumber);
+
+    const duration = numberOrNull(record.durationSeconds ?? record.duration_seconds);
+    if (duration !== null && (duration <= 0 || duration > 24 * 60 * 60)) {
+      return badRequest(`Track ${index + 1} has an invalid duration.`);
+    }
+    const bpm = numberOrNull(record.bpm);
+    if (bpm !== null && (bpm <= 0 || bpm >= 400)) {
+      return badRequest(`Track ${index + 1} has an invalid BPM.`);
+    }
+
+    const rawCredits = Array.isArray(record.credits) ? record.credits : [];
+    if (rawCredits.length > 100 || JSON.stringify(rawCredits).length > 20_000) {
+      return badRequest(`Track ${index + 1} has too much credit metadata.`);
+    }
+
+    tracks.push({
+      title,
+      trackNumber,
+      durationSeconds: duration,
+      bpm,
+      musicalKey: nullableText(record.musicalKey ?? record.musical_key, 32),
+      explicit: booleanValue(record.explicit, booleanValue(payload.explicit)),
+      isrc: nullableText(record.isrc, 64),
+      lyrics: nullableText(record.lyrics, 200_000),
+      credits: rawCredits,
+      asset,
+    });
+  }
+
+  return tracks;
+}
+
 async function createRelease(req: Request, ownerID: string): Promise<Response> {
+  const contentLength = Number(req.headers.get("content-length") ?? 0);
+  if (contentLength > 2_000_000) return badRequest("Release metadata is too large.");
   const payload = await req.json() as JsonRecord;
   const title = text(payload.title, 160);
-  const trackTitle = text(payload.trackTitle ?? payload.track_title ?? payload.title, 160);
-  const track = mediaRef(payload.track ?? payload.trackAsset ?? payload.track_asset);
   const cover = mediaRef(payload.cover ?? payload.coverAsset ?? payload.cover_asset);
   const status = releaseStatus(payload.status);
 
-  if (!title || !trackTitle) return badRequest("Release and track titles are required.");
-  if (!track) return badRequest("A master track asset is required.");
+  if (!title) return badRequest("A release title is required.");
+  const tracks = normalizeTracks(payload, ownerID);
+  if (tracks instanceof Response) return tracks;
 
   const ownerPrefix = `music/${ownerID.toLowerCase()}/`;
-  if (!track.objectKey.startsWith(ownerPrefix)) {
-    return badRequest("Track asset is outside the signed-in user's namespace.");
-  }
   if (cover && !cover.objectKey.startsWith(ownerPrefix)) {
     return badRequest("Cover asset is outside the signed-in user's namespace.");
   }
-
-  const duration = numberOrNull(payload.durationSeconds ?? payload.duration_seconds);
-  if (duration !== null && (duration <= 0 || duration > 24 * 60 * 60)) {
-    return badRequest("Invalid track duration.");
-  }
-  const bpm = numberOrNull(payload.bpm);
-  if (bpm !== null && (bpm <= 0 || bpm >= 400)) return badRequest("Invalid BPM.");
 
   const admin = serviceClient();
   const profile = await admin.from("account_profiles")
@@ -181,7 +271,14 @@ async function createRelease(req: Request, ownerID: string): Promise<Response> {
   const scrollsPostID = scrollsPostIDRaw ? uuid(scrollsPostIDRaw) : null;
   if (scrollsPostIDRaw && !scrollsPostID) return badRequest("Invalid Scrolls post ID.");
 
-  const result = await admin.rpc("apollo_create_release", {
+  const clientReleaseIDRaw = payload.clientReleaseID ?? payload.client_release_id;
+  const clientReleaseID = clientReleaseIDRaw ? uuid(clientReleaseIDRaw) : null;
+  if (clientReleaseIDRaw && !clientReleaseID) return badRequest("Invalid client release ID.");
+
+  const sourceCandidate = text(payload.sourceApp ?? payload.source_app, 40).toLowerCase();
+  const sourceApp = RELEASE_SOURCES.has(sourceCandidate) ? sourceCandidate : "apollo-daw";
+
+  const result = await admin.rpc("apollo_create_release_v2", {
     p_owner_id: ownerID,
     p_artist_handle: handle,
     p_artist_display_name: displayName,
@@ -193,17 +290,11 @@ async function createRelease(req: Request, ownerID: string): Promise<Response> {
     p_cover_provider: cover?.provider ?? null,
     p_cover_bucket: cover?.bucket ?? null,
     p_cover_object_key: cover?.objectKey ?? null,
-    p_track_title: trackTitle,
-    p_duration_seconds: duration,
-    p_bpm: bpm,
-    p_musical_key: nullableText(payload.musicalKey ?? payload.musical_key, 32),
-    p_track_provider: track.provider,
-    p_track_bucket: track.bucket,
-    p_track_object_key: track.objectKey,
-    p_track_mime_type: track.mimeType,
-    p_track_byte_size: track.byteSize,
+    p_tracks: tracks,
     p_scrolls_post_id: scrollsPostID,
+    p_client_release_id: clientReleaseID,
     p_status: status,
+    p_source_app: sourceApp,
   });
   if (result.error) return badRequest(result.error.message);
 
