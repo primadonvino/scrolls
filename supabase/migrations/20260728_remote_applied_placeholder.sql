@@ -1,0 +1,3 @@
+-- This migration version already exists in the linked production database.
+-- Keep a local no-op placeholder so later migrations can be planned without
+-- rewriting Supabase's remote migration history.
