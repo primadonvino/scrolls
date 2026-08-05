@@ -33,19 +33,6 @@ const R2_WEB_UPLOAD_ALLOWED_ORIGINS = [
 const R2_CORS_SYNC_INTERVAL_MS = 10 * 60 * 1000;
 let r2CorsLastSyncAt = 0;
 
-// Browser media uploads happen before the final post/profile mutation. The
-// mutation still enforces account ownership, so a temporary upload token should
-// not fail just because a web session's auth subject and active account id are
-// out of sync.
-const WEB_MEDIA_UPLOAD_ROOTS = new Set([
-  "avatars",
-  "music",
-  "podcasts",
-  "posts",
-  "profiles",
-  "tmp",
-]);
-
 const ALLOWED_CONTENT_TYPES: AllowedMediaType[] = [
   { contentType: "image/jpeg", maxBytes: 25 * 1024 * 1024 },
   { contentType: "image/png", maxBytes: 25 * 1024 * 1024 },
@@ -132,18 +119,7 @@ async function issueUploadToken(req: Request, authed: string): Promise<Response>
 
   const canWriteForOwner = await canActAsAccount(authed, ownerID);
   if (!canWriteForOwner) {
-    const root = objectKeyRoot(objectKey);
-    if (!WEB_MEDIA_UPLOAD_ROOTS.has(root)) {
-      return unauthorized();
-    }
-
-    console.warn(JSON.stringify({
-      event: "upload_token_scope_fallback",
-      authed,
-      ownerID,
-      root,
-      objectKey,
-    }));
+    return unauthorized("You cannot upload media for that account.");
   }
 
   const requestedBucket = normalizeText(payload.bucket) ?? configuredBucket;
@@ -252,10 +228,6 @@ function extractOwnerIDFromObjectKey(objectKey: string): string {
     return segments[1]?.trim().toLowerCase() ?? "";
   }
   return root;
-}
-
-function objectKeyRoot(objectKey: string): string {
-  return objectKey.split("/").filter(Boolean)[0]?.trim().toLowerCase() ?? "";
 }
 
 function normalizeBaseURL(value: string | null): string | null {
