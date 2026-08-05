@@ -20,9 +20,14 @@ type AllowedMediaType = {
 
 const MAX_URL_TTL_SECONDS = 300;
 const DEFAULT_URL_TTL_SECONDS = 300;
+// This list is pushed to the R2 bucket's CORS policy below, so an origin missing
+// here cannot upload from a browser at all - the preflight fails before any
+// token is used. Apollo Music shares this backend and lets artists replace
+// album artwork from the web, so its origin belongs here too.
 const R2_WEB_UPLOAD_ALLOWED_ORIGINS = [
   "https://scrolls.adastra.love",
   "https://scrolls-web.vercel.app",
+  "https://apollo.adastra.love",
   "http://localhost:3000",
 ];
 const R2_CORS_SYNC_INTERVAL_MS = 10 * 60 * 1000;
