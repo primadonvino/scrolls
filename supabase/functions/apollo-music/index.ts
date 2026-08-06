@@ -39,7 +39,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 const RELEASE_TYPES = new Set(["single", "ep", "album"]);
 const RELEASE_STATUSES = new Set(["draft", "published"]);
 const PLAY_SOURCES = new Set(["web", "ios", "android", "daw"]);
-const RELEASE_SOURCES = new Set(["apollo-daw", "apollo-ios"]);
+const RELEASE_SOURCES = new Set(["apollo-daw", "apollo-ios", "apollo-web"]);
 
 Deno.serve((req) => withRequestLogging(req, async (log) => {
   if (req.method === "OPTIONS") return optionsResponse();
