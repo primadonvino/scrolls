@@ -44,6 +44,7 @@ const ALLOWED_CONTENT_TYPES: AllowedMediaType[] = [
   { contentType: "audio/m4a", maxBytes: 200 * 1024 * 1024 },
   { contentType: "audio/mpeg", maxBytes: 200 * 1024 * 1024 },
   { contentType: "audio/aac", maxBytes: 200 * 1024 * 1024 },
+  { contentType: "audio/wav", maxBytes: 200 * 1024 * 1024 },
   { contentType: "video/mp4", maxBytes: 500 * 1024 * 1024 },
   { contentType: "video/quicktime", maxBytes: 500 * 1024 * 1024 },
 ];
