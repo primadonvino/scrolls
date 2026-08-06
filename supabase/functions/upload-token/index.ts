@@ -81,6 +81,7 @@ async function issueUploadToken(req: Request, authed: string): Promise<Response>
   const accountID = readEnv("CLOUDFLARE_R2_ACCOUNT_ID");
   const accessKeyID = readEnv("CLOUDFLARE_R2_ACCESS_KEY_ID");
   const secretAccessKey = readEnv("CLOUDFLARE_R2_SECRET_ACCESS_KEY");
+  const cloudflareAPIToken = readEnv("CLOUDFLARE_API_TOKEN");
   const configuredBucket = readEnv("CLOUDFLARE_R2_BUCKET") ?? "scrolls-media";
   const cdnBaseURL = normalizeBaseURL(readEnv("CLOUDFLARE_R2_CDN_BASE_URL"));
 
@@ -128,12 +129,20 @@ async function issueUploadToken(req: Request, authed: string): Promise<Response>
     return badRequest("Unsupported bucket.");
   }
 
-  await syncR2CorsPolicy({
-    accountID,
-    accessKeyID,
-    secretAccessKey,
-    bucket: configuredBucket,
-  });
+  const requestOrigin = req.headers.get("Origin")?.trim() ?? "";
+  if (requestOrigin) {
+    if (!R2_WEB_UPLOAD_ALLOWED_ORIGINS.includes(requestOrigin)) {
+      return unauthorized("This website is not allowed to upload media.");
+    }
+    if (!cloudflareAPIToken) {
+      return badRequest("R2 browser uploads are not configured.");
+    }
+    await syncR2CorsPolicy({
+      accountID,
+      apiToken: cloudflareAPIToken,
+      bucket: configuredBucket,
+    });
+  }
 
   const uploadURL = await createR2PresignedUploadURL({
     accountID,
@@ -169,31 +178,21 @@ async function issueUploadToken(req: Request, authed: string): Promise<Response>
 
 async function syncR2CorsPolicy(input: {
   accountID: string;
-  accessKeyID: string;
-  secretAccessKey: string;
+  apiToken: string;
   bucket: string;
 }) {
   const now = Date.now();
   if (now - r2CorsLastSyncAt < R2_CORS_SYNC_INTERVAL_MS) return;
-  try {
-    await ensureR2BucketCors({
-      ...input,
-      allowedOrigins: R2_WEB_UPLOAD_ALLOWED_ORIGINS,
-    });
-    r2CorsLastSyncAt = now;
-    console.log(JSON.stringify({
-      event: "r2_cors_sync_complete",
-      bucket: input.bucket,
-      origins: R2_WEB_UPLOAD_ALLOWED_ORIGINS,
-    }));
-  } catch (error) {
-    console.warn(JSON.stringify({
-      event: "r2_cors_sync_failed",
-      bucket: input.bucket,
-      origins: R2_WEB_UPLOAD_ALLOWED_ORIGINS,
-      error: error instanceof Error ? error.message : String(error),
-    }));
-  }
+  await ensureR2BucketCors({
+    ...input,
+    allowedOrigins: R2_WEB_UPLOAD_ALLOWED_ORIGINS,
+  });
+  r2CorsLastSyncAt = now;
+  console.log(JSON.stringify({
+    event: "r2_cors_sync_complete",
+    bucket: input.bucket,
+    origins: R2_WEB_UPLOAD_ALLOWED_ORIGINS,
+  }));
 }
 
 function normalizeText(value: unknown): string | null {
