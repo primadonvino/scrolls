@@ -1365,6 +1365,7 @@ async function updateCaption(req: Request, authed: string) {
   const payload = await req.json();
   const postID = String(payload.postID ?? "").trim();
   const requestedAuthorID = String(payload.authorID ?? "").trim();
+  const retainRemovedMusicAudio = payload.retainRemovedMusicAudio === true;
   if (!postID) return badRequest("postID required.");
 
   const authorID = await resolveAuthorIDForWrite(authed, requestedAuthorID);
@@ -1417,7 +1418,7 @@ async function updateCaption(req: Request, authed: string) {
   const write = await admin.from("posts").update(update).eq("id", postID).eq("author_id", authorID);
   if (write.error) return badRequest(write.error.message);
 
-  if (typeof newCaption === "string" && isMusicCaption(newCaption)) {
+  if (typeof newCaption === "string" && isMusicCaption(newCaption) && !retainRemovedMusicAudio) {
     const oldMusicTracks = parseMusicTrackMetadata(existing.data.caption);
     const newMusicTracks = parseMusicTrackMetadata(newCaption);
     await removeReplacedStorageRefsIfNeeded(

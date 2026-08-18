@@ -11,7 +11,7 @@ import {
   unauthorized,
   withRequestLogging,
 } from "../_shared/http.ts";
-import { resolveScopedAccountID } from "../_shared/account_scope.ts";
+import { canActAsAccount, resolveScopedAccountID } from "../_shared/account_scope.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -60,6 +60,9 @@ Deno.serve((req) => withRequestLogging(req, async (log) => {
     if (!authed) return unauthorized();
     if (req.method === "POST" && route === "releases") {
       return await createRelease(req, authed);
+    }
+    if (req.method === "DELETE" && route === "tracks") {
+      return await deleteTrack(req, authed);
     }
     if (req.method === "PATCH" && route === "publish") {
       return await publishRelease(req, authed);
@@ -342,6 +345,54 @@ async function publishRelease(req: Request, ownerID: string): Promise<Response> 
   if (updated.error) throw updated.error;
   if (!updated.data) return notFound();
   return json({ release: updated.data });
+}
+
+async function deleteTrack(req: Request, authedID: string): Promise<Response> {
+  const payload = await req.json() as JsonRecord;
+  const trackID = uuid(payload.trackID ?? payload.track_id);
+  if (!trackID) return badRequest("Valid trackID required.");
+
+  const admin = serviceClient();
+  const track = await admin.from("music_tracks")
+    .select("id,release_id,owner_id")
+    .eq("id", trackID)
+    .maybeSingle();
+  if (track.error) throw track.error;
+  if (!track.data) return notFound();
+
+  const ownerID = String(track.data.owner_id ?? "").trim().toLowerCase();
+  if (!ownerID || !await canActAsAccount(authedID, ownerID)) return unauthorized();
+
+  const visibleTracks = await admin.from("music_tracks")
+    .select("id", { count: "exact", head: true })
+    .eq("release_id", track.data.release_id);
+  if (visibleTracks.error) throw visibleTracks.error;
+  if ((visibleTracks.count ?? 0) <= 1) {
+    return badRequest("A release must keep at least one song.");
+  }
+
+  const deleted = await admin.from("music_tracks")
+    .delete()
+    .eq("id", trackID)
+    .eq("owner_id", ownerID);
+  if (deleted.error) throw deleted.error;
+
+  const remaining = await admin.from("music_tracks")
+    .select("id,track_number")
+    .eq("release_id", track.data.release_id)
+    .order("track_number", { ascending: true });
+  if (remaining.error) throw remaining.error;
+  for (let index = 0; index < (remaining.data ?? []).length; index += 1) {
+    const row = remaining.data![index];
+    const trackNumber = index + 1;
+    if (row.track_number === trackNumber) continue;
+    const renumbered = await admin.from("music_tracks")
+      .update({ track_number: trackNumber })
+      .eq("id", row.id)
+      .eq("owner_id", ownerID);
+    if (renumbered.error) throw renumbered.error;
+  }
+  return json({ ok: true, trackID, releaseID: track.data.release_id });
 }
 
 async function releaseAnalytics(url: URL, ownerID: string): Promise<Response> {
