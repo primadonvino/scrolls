@@ -134,14 +134,25 @@ async function issueUploadToken(req: Request, authed: string): Promise<Response>
     if (!R2_WEB_UPLOAD_ALLOWED_ORIGINS.includes(requestOrigin)) {
       return unauthorized("This website is not allowed to upload media.");
     }
-    if (!cloudflareAPIToken) {
-      return badRequest("R2 browser uploads are not configured.");
+    // Bucket CORS is infrastructure configuration, not a prerequisite that
+    // should make an otherwise valid artist upload fail. Keep refreshing it
+    // opportunistically, but still issue a presigned URL if Cloudflare's
+    // management API is unavailable or its separate API token has expired.
+    if (cloudflareAPIToken) {
+      try {
+        await syncR2CorsPolicy({
+          accountID,
+          apiToken: cloudflareAPIToken,
+          bucket: configuredBucket,
+        });
+      } catch (error) {
+        console.warn(JSON.stringify({
+          event: "r2_cors_sync_failed",
+          bucket: configuredBucket,
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      }
     }
-    await syncR2CorsPolicy({
-      accountID,
-      apiToken: cloudflareAPIToken,
-      bucket: configuredBucket,
-    });
   }
 
   const uploadURL = await createR2PresignedUploadURL({
