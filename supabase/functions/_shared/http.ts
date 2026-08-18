@@ -82,7 +82,7 @@ type RequestHandler = (log: RequestLogContext) => Promise<Response> | Response;
 export function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-idempotency-key",
+    "Access-Control-Allow-Headers": "authorization, x-scrolls-user-authorization, x-client-info, apikey, content-type, x-idempotency-key",
     "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
   };
 }
@@ -181,7 +181,11 @@ export function founderUserIDs(): string[] {
 
 export async function currentUserId(req: Request): Promise<string | null> {
   requireEnv();
-  const authHeader = req.headers.get("Authorization");
+  // The platform gateway still expects the project's legacy JWT on
+  // Authorization in some deployments. Web clients can carry the actual user
+  // session separately; it is always verified against Supabase Auth below.
+  const authHeader = req.headers.get("X-Scrolls-User-Authorization")
+    ?? req.headers.get("Authorization");
   if (!authHeader) return null;
   const token = authHeader.replace(/^Bearer\s+/i, "").trim();
   if (!token) return null;
