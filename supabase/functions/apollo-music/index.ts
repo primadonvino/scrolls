@@ -11,6 +11,7 @@ import {
   unauthorized,
   withRequestLogging,
 } from "../_shared/http.ts";
+import { resolveScopedAccountID } from "../_shared/account_scope.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -141,6 +142,12 @@ function mediaRef(value: unknown): MediaReference | null {
   };
 }
 
+function musicOwnerIDFromObjectKey(objectKey: string | null | undefined): string {
+  const segments = String(objectKey ?? "").split("/").filter(Boolean);
+  if (segments[0]?.toLowerCase() !== "music") return "";
+  return String(segments[1] ?? "").trim().toLowerCase();
+}
+
 function normalizeTracks(payload: JsonRecord, ownerID: string): NormalizedTrack[] | Response {
   const rawTracks = Array.isArray(payload.tracks)
     ? payload.tracks
@@ -213,12 +220,30 @@ function normalizeTracks(payload: JsonRecord, ownerID: string): NormalizedTrack[
   return tracks;
 }
 
-async function createRelease(req: Request, ownerID: string): Promise<Response> {
+async function createRelease(req: Request, authedID: string): Promise<Response> {
   const contentLength = Number(req.headers.get("content-length") ?? 0);
   if (contentLength > 2_000_000) return badRequest("Release metadata is too large.");
   const payload = await req.json() as JsonRecord;
-  const title = text(payload.title, 160);
   const cover = mediaRef(payload.cover ?? payload.coverAsset ?? payload.cover_asset);
+  const firstTrack = Array.isArray(payload.tracks) && payload.tracks[0]
+    && typeof payload.tracks[0] === "object" && !Array.isArray(payload.tracks[0])
+    ? payload.tracks[0] as JsonRecord
+    : null;
+  const firstTrackAsset = firstTrack
+    ? mediaRef(firstTrack.asset ?? firstTrack.track ?? firstTrack.trackAsset ?? firstTrack.track_asset)
+    : null;
+  const explicitOwnerID = text(
+    payload.ownerID ?? payload.owner_id ?? payload.authorID ?? payload.author_id,
+    64,
+  ).toLowerCase();
+  // Older clients did not send authorID to this final catalog step. Their
+  // signed asset path still identifies the account, and the scope resolver
+  // below verifies that the authenticated user is allowed to act for it.
+  const requestedOwnerID = explicitOwnerID
+    || musicOwnerIDFromObjectKey(cover?.objectKey ?? firstTrackAsset?.objectKey);
+  const ownerID = await resolveScopedAccountID(authedID, requestedOwnerID);
+  if (!ownerID) return unauthorized("You cannot publish music for that account.");
+  const title = text(payload.title, 160);
   const status = releaseStatus(payload.status);
 
   if (!title) return badRequest("A release title is required.");
