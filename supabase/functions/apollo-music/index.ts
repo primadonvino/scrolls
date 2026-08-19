@@ -64,6 +64,9 @@ Deno.serve((req) => withRequestLogging(req, async (log) => {
     if (req.method === "DELETE" && route === "tracks") {
       return await deleteTrack(req, authed);
     }
+    if (req.method === "DELETE" && route === "releases") {
+      return await deleteRelease(req, authed);
+    }
     if (req.method === "PATCH" && route === "publish") {
       return await publishRelease(req, authed);
     }
@@ -393,6 +396,41 @@ async function deleteTrack(req: Request, authedID: string): Promise<Response> {
     if (renumbered.error) throw renumbered.error;
   }
   return json({ ok: true, trackID, releaseID: track.data.release_id });
+}
+
+async function deleteRelease(req: Request, authedID: string): Promise<Response> {
+  const payload = await req.json() as JsonRecord;
+  const releaseID = uuid(payload.releaseID ?? payload.release_id);
+  if (!releaseID) return badRequest("Valid releaseID required.");
+
+  const admin = serviceClient();
+  const release = await admin.from("music_releases")
+    .select("id,owner_id,scrolls_post_id")
+    .eq("id", releaseID)
+    .maybeSingle();
+  if (release.error) throw release.error;
+  if (!release.data) return notFound();
+
+  const ownerID = String(release.data.owner_id ?? "").trim().toLowerCase();
+  if (!ownerID || !await canActAsAccount(authedID, ownerID)) return unauthorized();
+
+  // Foreign keys cascade through tracks, assets, likes, library entries and
+  // play events. Storage is handled by the linked Scrolls post deletion or the
+  // orphan sweep, so this endpoint never accepts a caller-supplied object key.
+  const deleted = await admin.from("music_releases")
+    .delete()
+    .eq("id", releaseID)
+    .eq("owner_id", ownerID)
+    .select("id")
+    .maybeSingle();
+  if (deleted.error) throw deleted.error;
+  if (!deleted.data) return notFound();
+
+  return json({
+    ok: true,
+    releaseID,
+    scrollsPostID: release.data.scrolls_post_id ?? null,
+  });
 }
 
 async function releaseAnalytics(url: URL, ownerID: string): Promise<Response> {
