@@ -158,7 +158,6 @@ function normalizeTracks(payload: JsonRecord, ownerID: string): NormalizedTrack[
     return badRequest("A release requires between 1 and 100 tracks.");
   }
 
-  const ownerPrefix = `music/${ownerID.toLowerCase()}/`;
   const usedTrackNumbers = new Set<number>();
   const tracks: NormalizedTrack[] = [];
 
@@ -172,7 +171,7 @@ function normalizeTracks(payload: JsonRecord, ownerID: string): NormalizedTrack[
     const asset = mediaRef(record.asset ?? record.track ?? record.trackAsset ?? record.track_asset);
     if (!title) return badRequest(`Track ${index + 1} requires a title.`);
     if (!asset) return badRequest(`Track ${index + 1} requires a master asset.`);
-    if (!asset.objectKey.startsWith(ownerPrefix)) {
+    if (!isOwnedObjectKey(asset.objectKey, ownerID)) {
       return badRequest(`Track ${index + 1} is outside the signed-in user's namespace.`);
     }
 
@@ -213,6 +212,29 @@ function normalizeTracks(payload: JsonRecord, ownerID: string): NormalizedTrack[
   return tracks;
 }
 
+/**
+ * Storage this user owns.
+ *
+ * Apollo writes new media under `music/<owner>/...`, but a back catalogue
+ * published through Scrolls is spread across several roots that predate it -
+ * `posts/<owner>/...` for a post's own asset, and older releases with the owner
+ * id as the very first segment. Requiring one fixed prefix would mean copying
+ * hundreds of megabytes of audio to a new path just to import metadata.
+ *
+ * The rule is therefore positional rather than a fixed prefix: the owner id has
+ * to be the first or second path segment. That keeps the property this check
+ * exists for - you cannot point a release at another user's objects - while
+ * accepting every layout this account already has.
+ */
+function isOwnedObjectKey(objectKey: string, ownerID: string): boolean {
+  const owner = ownerID.trim().toLowerCase();
+  if (!owner) return false;
+  const segments = objectKey.toLowerCase().split("/").filter((part) => part.length > 0);
+  // A bare key with no directory cannot belong to anyone in particular.
+  if (segments.length < 2) return false;
+  return segments[0] === owner || segments[1] === owner;
+}
+
 async function createRelease(req: Request, ownerID: string): Promise<Response> {
   const contentLength = Number(req.headers.get("content-length") ?? 0);
   if (contentLength > 2_000_000) return badRequest("Release metadata is too large.");
@@ -225,8 +247,7 @@ async function createRelease(req: Request, ownerID: string): Promise<Response> {
   const tracks = normalizeTracks(payload, ownerID);
   if (tracks instanceof Response) return tracks;
 
-  const ownerPrefix = `music/${ownerID.toLowerCase()}/`;
-  if (cover && !cover.objectKey.startsWith(ownerPrefix)) {
+  if (cover && !isOwnedObjectKey(cover.objectKey, ownerID)) {
     return badRequest("Cover asset is outside the signed-in user's namespace.");
   }
 
