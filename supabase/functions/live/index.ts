@@ -33,6 +33,7 @@ const VIEWER_PASSWORD_MAX_CHARS = 128;
 const VIEWER_PASSWORD_PBKDF2_ITERATIONS = 150_000;
 const VIEWER_PASSWORD_VERIFY_LIMIT = 10;
 const VIEWER_PASSWORD_VERIFY_WINDOW_MS = 60_000;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RADIO_BROADCASTER_IDS = new Set(
   (Deno.env.get('APOLLO_RADIO_BROADCASTER_IDS') ?? '')
     .split(',')
@@ -66,6 +67,20 @@ type LiveStreamCommentWire = {
 
 type BroadcastKind = 'video' | 'radio';
 
+type RadioNowPlayingWire = {
+  id: string;
+  title: string;
+  trackNumber: number;
+  explicit: boolean;
+  releaseID: string;
+  releaseTitle: string;
+  artistName: string;
+  artistHandle: string;
+  artworkProvider: string | null;
+  artworkBucket: string | null;
+  artworkObjectKey: string | null;
+};
+
 Deno.serve((req) => withRequestLogging(req, async (log) => {
   if (req.method === 'OPTIONS') return optionsResponse();
   try {
@@ -98,6 +113,15 @@ Deno.serve((req) => withRequestLogging(req, async (log) => {
     }
     if (req.method === 'GET' && path.length === 2 && path[0] === 'radio' && path[1] === 'session') {
       return await fetchActiveRadioSession(url, authed, log);
+    }
+    if (req.method === 'PATCH' && path.length === 3 && path[0] === 'radio' && path[1] === 'session' && path[2] === 'now-playing') {
+      return await updateRadioNowPlaying(req, authed, log);
+    }
+    if (req.method === 'GET' && path.length === 2 && path[0] === 'radio' && path[1] === 'library') {
+      return await fetchRadioLibraryStatus(url, authed, log);
+    }
+    if (req.method === 'POST' && path.length === 2 && path[0] === 'radio' && path[1] === 'library') {
+      return await saveRadioTrackToLibrary(req, authed, log);
     }
     if (req.method === 'POST' && path.length === 2 && path[0] === 'radio' && path[1] === 'session') {
       return await createSession(req, authed, log, 'radio');
@@ -184,6 +208,18 @@ function normalizeOptionalText(input: unknown, maxChars: number): string | null 
   return raw.slice(0, maxChars);
 }
 
+function normalizeUUID(input: unknown): string | null {
+  const value = String(input ?? '').trim().toLowerCase();
+  return UUID_PATTERN.test(value) ? value : null;
+}
+
+function relationRecord(value: unknown): Record<string, unknown> | null {
+  const candidate = Array.isArray(value) ? value[0] : value;
+  return candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+    ? candidate as Record<string, unknown>
+    : null;
+}
+
 function normalizeIdempotencyKey(input: unknown): string | null {
   const raw = String(input ?? '').trim();
   if (!raw) return null;
@@ -201,7 +237,11 @@ function normalizedBase(value: string, fallback: string): string {
   return source.replace(/\/+$/, '');
 }
 
-function sessionWire(row: Record<string, unknown>, resolvedPlayback?: CloudflareResolvedPlayback) {
+function sessionWire(
+  row: Record<string, unknown>,
+  resolvedPlayback?: CloudflareResolvedPlayback,
+  nowPlaying?: RadioNowPlayingWire | null,
+) {
   const rawTipGoal = row.tip_goal;
   const tipGoal = rawTipGoal != null && rawTipGoal !== '' ? Number(rawTipGoal) : null;
   const playbackURL = resolvedPlayback?.playbackURL ?? String(row.playback_url ?? '').trim();
@@ -211,6 +251,10 @@ function sessionWire(row: Record<string, unknown>, resolvedPlayback?: Cloudflare
     ownerUserID: String(row.owner_user_id ?? ''),
     mode: String(row.mode ?? 'mobile'),
     broadcastKind: normalizeBroadcastKind(row.broadcast_kind),
+    nowPlaying: nowPlaying ?? null,
+    nowPlayingUpdatedAt: row.now_playing_updated_at
+      ? new Date(String(row.now_playing_updated_at)).toISOString()
+      : null,
     title: normalizeOptionalText(row.title, TITLE_MAX_CHARS),
     description: normalizeOptionalText(row.description, DESCRIPTION_MAX_CHARS),
     streamKey: String(row.stream_key ?? ''),
@@ -231,8 +275,12 @@ function sessionWire(row: Record<string, unknown>, resolvedPlayback?: Cloudflare
   };
 }
 
-function viewerSessionWire(row: Record<string, unknown>, resolvedPlayback?: CloudflareResolvedPlayback) {
-  const base = sessionWire(row, resolvedPlayback);
+function viewerSessionWire(
+  row: Record<string, unknown>,
+  resolvedPlayback?: CloudflareResolvedPlayback,
+  nowPlaying?: RadioNowPlayingWire | null,
+) {
+  const base = sessionWire(row, resolvedPlayback, nowPlaying);
   return {
     ...base,
     streamKey: '',
@@ -1297,6 +1345,53 @@ function actorHasRadioAccess(actorID: string, authed: string): boolean {
     || RADIO_BROADCASTER_IDS.has(authed);
 }
 
+async function fetchRadioNowPlayingTracks(
+  trackIDs: string[],
+): Promise<Map<string, RadioNowPlayingWire>> {
+  const normalized = Array.from(new Set(trackIDs.map(normalizeUUID).filter((id): id is string => Boolean(id))));
+  const resolved = new Map<string, RadioNowPlayingWire>();
+  if (!normalized.length) return resolved;
+
+  const tracks = await serviceClient().from('music_tracks')
+    .select(
+      'id,title,track_number,explicit,release_id,'
+      + 'music_releases!inner(id,title,status,published_at,cover_provider,cover_bucket,cover_object_key,'
+      + 'music_artists!inner(handle,display_name))',
+    )
+    .in('id', normalized)
+    .eq('music_releases.status', 'published')
+    .lte('music_releases.published_at', new Date().toISOString());
+  if (tracks.error) throw tracks.error;
+
+  for (const raw of (tracks.data ?? []) as Array<Record<string, unknown>>) {
+    const trackID = normalizeUUID(raw.id);
+    const release = relationRecord(raw.music_releases);
+    const artist = relationRecord(release?.music_artists);
+    const releaseID = normalizeUUID(release?.id ?? raw.release_id);
+    if (!trackID || !release || !artist || !releaseID) continue;
+    resolved.set(trackID, {
+      id: trackID,
+      title: String(raw.title ?? '').trim() || 'Untitled song',
+      trackNumber: Math.max(1, Number(raw.track_number ?? 1) || 1),
+      explicit: Boolean(raw.explicit ?? false),
+      releaseID,
+      releaseTitle: String(release.title ?? '').trim() || 'Untitled release',
+      artistName: String(artist.display_name ?? '').trim() || 'Unknown artist',
+      artistHandle: String(artist.handle ?? '').trim(),
+      artworkProvider: normalizeOptionalText(release.cover_provider, 40),
+      artworkBucket: normalizeOptionalText(release.cover_bucket, 160),
+      artworkObjectKey: normalizeOptionalText(release.cover_object_key, 512),
+    });
+  }
+  return resolved;
+}
+
+async function radioNowPlayingForRow(row: Record<string, unknown>): Promise<RadioNowPlayingWire | null> {
+  const trackID = normalizeUUID(row.now_playing_track_id);
+  if (!trackID) return null;
+  return (await fetchRadioNowPlayingTracks([trackID])).get(trackID) ?? null;
+}
+
 async function fetchRadioAccess(url: URL, authed: string, log: RequestLogContext) {
   const actorID = await resolvedActorID(authed, url.searchParams.get('user_id'));
   if (!actorID) return unauthorized('Radio account scope denied.');
@@ -1319,7 +1414,10 @@ async function fetchActiveRadioSession(url: URL, authed: string, log: RequestLog
     .limit(1)
     .maybeSingle();
   if (session.error) return badRequest(session.error.message);
-  return json({ session: session.data ? sessionWire(session.data as Record<string, unknown>) : null });
+  if (!session.data) return json({ session: null });
+  const row = session.data as Record<string, unknown>;
+  const nowPlaying = await radioNowPlayingForRow(row);
+  return json({ session: sessionWire(row, undefined, nowPlaying) });
 }
 
 async function fetchActiveRadioSessions(log: RequestLogContext) {
@@ -1334,20 +1432,124 @@ async function fetchActiveRadioSessions(log: RequestLogContext) {
 
   const rows = (sessions.data ?? []) as Array<Record<string, unknown>>;
   const ownerIDs = Array.from(new Set(rows.map((row) => String(row.owner_user_id ?? '')).filter(Boolean)));
+  const trackIDs = rows.map((row) => String(row.now_playing_track_id ?? '')).filter(Boolean);
   setLogAccountScope(log, ownerIDs.length ? ownerIDs : 'public-radio');
   const users = await fetchUsersByIds(ownerIDs);
+  const nowPlaying = await fetchRadioNowPlayingTracks(trackIDs);
   const resolved = await Promise.all(rows.map(async (row) => {
     const ownerID = String(row.owner_user_id ?? '');
     const ownerUser = users[ownerID];
     if (!ownerUser || ownerUser.isPrivate) return null;
     const playback = await resolveViewerPlaybackForRow(row, { hideUntilReady: true });
     return {
-      ...viewerSessionWire(row, playback),
+      ...viewerSessionWire(
+        row,
+        playback,
+        nowPlaying.get(String(row.now_playing_track_id ?? '').trim().toLowerCase()) ?? null,
+      ),
       ownerUser,
       owner_user: ownerUser,
     };
   }));
   return json({ sessions: resolved.filter(Boolean) });
+}
+
+async function updateRadioNowPlaying(req: Request, authed: string, log: RequestLogContext) {
+  const payload = await req.json().catch(() => ({})) as Record<string, unknown>;
+  const actorID = await resolvedActorID(authed, payload.user_id ?? payload.userID);
+  if (!actorID) return unauthorized('Radio account scope denied.');
+  setLogAccountScope(log, actorID);
+  if (!actorHasRadioAccess(actorID, authed)) return forbidden('This account does not have Apollo Radio access.');
+
+  const sessionID = normalizeUUID(payload.session_id ?? payload.sessionID);
+  if (!sessionID) return badRequest('A valid radio session is required.');
+
+  const rawTrackID = String(payload.track_id ?? payload.trackID ?? '').trim();
+  const trackID = rawTrackID ? normalizeUUID(rawTrackID) : null;
+  if (rawTrackID && !trackID) return badRequest('A valid Apollo catalog track is required.');
+
+  const admin = serviceClient();
+  const active = await admin.from('live_stream_sessions')
+    .select('*')
+    .eq('id', sessionID)
+    .eq('owner_user_id', actorID)
+    .eq('broadcast_kind', 'radio')
+    .eq('status', 'active')
+    .maybeSingle();
+  if (active.error) return badRequest(active.error.message);
+  if (!active.data) return notFound();
+
+  let selectedTrack: RadioNowPlayingWire | null = null;
+  if (trackID) {
+    selectedTrack = (await fetchRadioNowPlayingTracks([trackID])).get(trackID) ?? null;
+    if (!selectedTrack) return badRequest('Choose a published song from the Apollo catalog.');
+  }
+
+  const nowISO = new Date().toISOString();
+  const updated = await admin.from('live_stream_sessions')
+    .update({
+      now_playing_track_id: trackID,
+      now_playing_updated_at: trackID ? nowISO : null,
+      updated_at: nowISO,
+    })
+    .eq('id', sessionID)
+    .eq('owner_user_id', actorID)
+    .eq('status', 'active')
+    .select('*')
+    .single();
+  if (updated.error || !updated.data) {
+    return badRequest(updated.error?.message ?? 'Could not update the current radio song.');
+  }
+  return json({ session: sessionWire(updated.data as Record<string, unknown>, undefined, selectedTrack) });
+}
+
+async function fetchRadioLibraryStatus(url: URL, authed: string, log: RequestLogContext) {
+  const actorID = await resolvedActorID(authed, url.searchParams.get('user_id'));
+  if (!actorID) return unauthorized('Library account scope denied.');
+  setLogAccountScope(log, actorID);
+  const trackID = normalizeUUID(url.searchParams.get('track_id'));
+  if (!trackID) return badRequest('A valid Apollo catalog track is required.');
+
+  const saved = await serviceClient().from('music_library_items')
+    .select('id')
+    .eq('user_id', actorID)
+    .eq('track_id', trackID)
+    .limit(1)
+    .maybeSingle();
+  if (saved.error) return badRequest(saved.error.message);
+  return json({ saved: Boolean(saved.data) });
+}
+
+async function saveRadioTrackToLibrary(req: Request, authed: string, log: RequestLogContext) {
+  const payload = await req.json().catch(() => ({})) as Record<string, unknown>;
+  const actorID = await resolvedActorID(authed, payload.user_id ?? payload.userID);
+  if (!actorID) return unauthorized('Library account scope denied.');
+  setLogAccountScope(log, actorID);
+  const trackID = normalizeUUID(payload.track_id ?? payload.trackID);
+  if (!trackID) return badRequest('A valid Apollo catalog track is required.');
+
+  const track = (await fetchRadioNowPlayingTracks([trackID])).get(trackID);
+  if (!track) return badRequest('Only published Apollo catalog songs can be saved.');
+
+  const admin = serviceClient();
+  const existing = await admin.from('music_library_items')
+    .select('id')
+    .eq('user_id', actorID)
+    .eq('track_id', trackID)
+    .limit(1)
+    .maybeSingle();
+  if (existing.error) return badRequest(existing.error.message);
+  if (existing.data) return json({ saved: true, idempotent: true });
+
+  const inserted = await admin.from('music_library_items')
+    .insert({ user_id: actorID, track_id: trackID })
+    .select('id')
+    .single();
+  if (inserted.error) {
+    if (inserted.error.code === '23505') return json({ saved: true, idempotent: true });
+    return badRequest(inserted.error.message);
+  }
+  return json({ saved: true, idempotent: false }, 201);
 }
 
 async function fetchActiveSession(url: URL, authed: string, log: RequestLogContext) {
