@@ -56,6 +56,9 @@ Deno.serve((req) => withRequestLogging(req, async (log) => {
     if (req.method === "POST" && route === "plays") {
       return await recordPlay(req, authed);
     }
+    if (req.method === "POST" && route === "ad-impressions") {
+      return await recordAdImpression(req, authed);
+    }
 
     if (!authed) return unauthorized();
     if (req.method === "POST" && route === "releases") {
@@ -524,6 +527,97 @@ async function recordPlay(req: Request, userID: string | null): Promise<Response
     listener_hash: listenerHash,
     ms_played: acceptedMS,
     completed: durationMS > 0 && acceptedMS >= Math.round(durationMS * 0.9),
+    source,
+  });
+  if (inserted.error) {
+    if (inserted.error.code === "23505") return json({ counted: false, reason: "duplicate" });
+    throw inserted.error;
+  }
+
+  return json({ counted: true });
+}
+
+async function recordAdImpression(req: Request, userID: string | null): Promise<Response> {
+  const payload = await req.json() as JsonRecord;
+  const adID = uuid(payload.adID ?? payload.ad_id);
+  const sessionID = uuid(payload.sessionID ?? payload.session_id);
+  if (!adID || !sessionID) return badRequest("Valid adID and sessionID are required.");
+
+  const requestedMS = integerOrNull(payload.msPlayed ?? payload.ms_played);
+  if (requestedMS === null) return badRequest("msPlayed is required.");
+
+  const admin = serviceClient();
+  const adResult = await admin.from("music_ads")
+    .select("id,duration_seconds,is_active,starts_at,ends_at")
+    .eq("id", adID)
+    .maybeSingle();
+  if (adResult.error) throw adResult.error;
+  if (!adResult.data || !adResult.data.is_active) return notFound();
+
+  const durationSeconds = Number(adResult.data.duration_seconds ?? 0);
+  const durationMS = durationSeconds > 0 ? Math.round(durationSeconds * 1000) : 0;
+  const acceptedMS = Math.min(requestedMS, durationMS > 0 ? durationMS : 30 * 60 * 1000);
+  if (acceptedMS < 3_000) return json({ counted: false, reason: "listen-threshold" });
+
+  const now = Date.now();
+  const startsAt = adResult.data.starts_at ? new Date(adResult.data.starts_at).getTime() : null;
+  const endsAt = adResult.data.ends_at ? new Date(adResult.data.ends_at).getTime() : null;
+  const endGraceMS = durationMS > 0 ? durationMS : 5 * 60 * 1000;
+  if ((startsAt !== null && startsAt > now) || (endsAt !== null && endsAt + endGraceMS < now)) {
+    return notFound();
+  }
+
+  const listenerHash = await playListenerHash(req, userID);
+  const completed = durationMS > 0 && acceptedMS >= Math.round(durationMS * 0.9);
+  const existing = await admin.from("music_ad_impressions")
+    .select("id,listener_hash,ms_played,completed")
+    .eq("ad_id", adID)
+    .eq("session_id", sessionID)
+    .maybeSingle();
+  if (existing.error) throw existing.error;
+
+  if (existing.data) {
+    if (existing.data.listener_hash !== listenerHash) {
+      return json({ counted: false, reason: "duplicate" });
+    }
+    const nextMS = Math.max(Number(existing.data.ms_played ?? 0), acceptedMS);
+    const nextCompleted = Boolean(existing.data.completed) || completed;
+    if (nextMS === existing.data.ms_played && nextCompleted === existing.data.completed) {
+      return json({ counted: true, updated: false });
+    }
+    const updated = await admin.from("music_ad_impressions")
+      .update({ ms_played: nextMS, completed: nextCompleted })
+      .eq("id", existing.data.id);
+    if (updated.error) throw updated.error;
+    return json({ counted: true, updated: true });
+  }
+
+  const hourAgo = new Date(now - 60 * 60 * 1000).toISOString();
+  const dayAgo = new Date(now - 24 * 60 * 60 * 1000).toISOString();
+  const hourly = await admin.from("music_ad_impressions")
+    .select("id", { count: "exact", head: true })
+    .eq("listener_hash", listenerHash)
+    .gte("created_at", hourAgo);
+  if (hourly.error) throw hourly.error;
+  if ((hourly.count ?? 0) >= 30) return json({ counted: false, reason: "rate-limit" }, 429);
+
+  const sameAd = await admin.from("music_ad_impressions")
+    .select("id", { count: "exact", head: true })
+    .eq("listener_hash", listenerHash)
+    .eq("ad_id", adID)
+    .gte("created_at", dayAgo);
+  if (sameAd.error) throw sameAd.error;
+  if ((sameAd.count ?? 0) >= 3) return json({ counted: false, reason: "ad-rate-limit" });
+
+  const sourceRaw = String(payload.source ?? "web").trim().toLowerCase();
+  const source = PLAY_SOURCES.has(sourceRaw) ? sourceRaw : "web";
+  const inserted = await admin.from("music_ad_impressions").insert({
+    ad_id: adID,
+    user_id: userID,
+    session_id: sessionID,
+    listener_hash: listenerHash,
+    ms_played: acceptedMS,
+    completed,
     source,
   });
   if (inserted.error) {
