@@ -11,6 +11,7 @@ import {
   unauthorized,
   withRequestLogging,
 } from "../_shared/http.ts";
+import { canActAsAccount, resolveScopedAccountID } from "../_shared/account_scope.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -55,10 +56,19 @@ Deno.serve((req) => withRequestLogging(req, async (log) => {
     if (req.method === "POST" && route === "plays") {
       return await recordPlay(req, authed);
     }
+    if (req.method === "POST" && route === "ad-impressions") {
+      return await recordAdImpression(req, authed);
+    }
 
     if (!authed) return unauthorized();
     if (req.method === "POST" && route === "releases") {
       return await createRelease(req, authed);
+    }
+    if (req.method === "DELETE" && route === "tracks") {
+      return await deleteTrack(req, authed);
+    }
+    if (req.method === "DELETE" && route === "releases") {
+      return await deleteRelease(req, authed);
     }
     if (req.method === "PATCH" && route === "publish") {
       return await publishRelease(req, authed);
@@ -141,6 +151,35 @@ function mediaRef(value: unknown): MediaReference | null {
   };
 }
 
+function musicOwnerIDFromObjectKey(objectKey: string | null | undefined): string {
+  const segments = String(objectKey ?? "").split("/").filter(Boolean);
+  if (segments[0]?.toLowerCase() !== "music") return "";
+  return String(segments[1] ?? "").trim().toLowerCase();
+}
+
+/**
+ * Storage this user owns.
+ *
+ * Apollo writes new media under `music/<owner>/...`, but a back catalogue
+ * published through Scrolls is spread across roots that predate it -
+ * `posts/<owner>/...` for a post's own asset, and older releases with the owner
+ * id as the very first segment. Requiring one fixed prefix would mean copying
+ * hundreds of megabytes of audio to a new path just to import metadata.
+ *
+ * The rule is therefore positional rather than a fixed prefix: the owner id has
+ * to be the first or second path segment. That keeps the property this check
+ * exists for - you cannot point a release at another user's objects - while
+ * accepting every layout an account may already have.
+ */
+function isOwnedObjectKey(objectKey: string, ownerID: string): boolean {
+  const owner = ownerID.trim().toLowerCase();
+  if (!owner) return false;
+  const segments = objectKey.toLowerCase().split("/").filter((part) => part.length > 0);
+  // A bare key with no directory cannot belong to anyone in particular.
+  if (segments.length < 2) return false;
+  return segments[0] === owner || segments[1] === owner;
+}
+
 function normalizeTracks(payload: JsonRecord, ownerID: string): NormalizedTrack[] | Response {
   const rawTracks = Array.isArray(payload.tracks)
     ? payload.tracks
@@ -212,35 +251,30 @@ function normalizeTracks(payload: JsonRecord, ownerID: string): NormalizedTrack[
   return tracks;
 }
 
-/**
- * Storage this user owns.
- *
- * Apollo writes new media under `music/<owner>/...`, but a back catalogue
- * published through Scrolls is spread across several roots that predate it -
- * `posts/<owner>/...` for a post's own asset, and older releases with the owner
- * id as the very first segment. Requiring one fixed prefix would mean copying
- * hundreds of megabytes of audio to a new path just to import metadata.
- *
- * The rule is therefore positional rather than a fixed prefix: the owner id has
- * to be the first or second path segment. That keeps the property this check
- * exists for - you cannot point a release at another user's objects - while
- * accepting every layout this account already has.
- */
-function isOwnedObjectKey(objectKey: string, ownerID: string): boolean {
-  const owner = ownerID.trim().toLowerCase();
-  if (!owner) return false;
-  const segments = objectKey.toLowerCase().split("/").filter((part) => part.length > 0);
-  // A bare key with no directory cannot belong to anyone in particular.
-  if (segments.length < 2) return false;
-  return segments[0] === owner || segments[1] === owner;
-}
-
-async function createRelease(req: Request, ownerID: string): Promise<Response> {
+async function createRelease(req: Request, authedID: string): Promise<Response> {
   const contentLength = Number(req.headers.get("content-length") ?? 0);
   if (contentLength > 2_000_000) return badRequest("Release metadata is too large.");
   const payload = await req.json() as JsonRecord;
-  const title = text(payload.title, 160);
   const cover = mediaRef(payload.cover ?? payload.coverAsset ?? payload.cover_asset);
+  const firstTrack = Array.isArray(payload.tracks) && payload.tracks[0]
+    && typeof payload.tracks[0] === "object" && !Array.isArray(payload.tracks[0])
+    ? payload.tracks[0] as JsonRecord
+    : null;
+  const firstTrackAsset = firstTrack
+    ? mediaRef(firstTrack.asset ?? firstTrack.track ?? firstTrack.trackAsset ?? firstTrack.track_asset)
+    : null;
+  const explicitOwnerID = text(
+    payload.ownerID ?? payload.owner_id ?? payload.authorID ?? payload.author_id,
+    64,
+  ).toLowerCase();
+  // Older clients did not send authorID to this final catalog step. Their
+  // signed asset path still identifies the account, and the scope resolver
+  // below verifies that the authenticated user is allowed to act for it.
+  const requestedOwnerID = explicitOwnerID
+    || musicOwnerIDFromObjectKey(cover?.objectKey ?? firstTrackAsset?.objectKey);
+  const ownerID = await resolveScopedAccountID(authedID, requestedOwnerID);
+  if (!ownerID) return unauthorized("You cannot publish music for that account.");
+  const title = text(payload.title, 160);
   const status = releaseStatus(payload.status);
 
   if (!title) return badRequest("A release title is required.");
@@ -340,6 +374,89 @@ async function publishRelease(req: Request, ownerID: string): Promise<Response> 
   return json({ release: updated.data });
 }
 
+async function deleteTrack(req: Request, authedID: string): Promise<Response> {
+  const payload = await req.json() as JsonRecord;
+  const trackID = uuid(payload.trackID ?? payload.track_id);
+  if (!trackID) return badRequest("Valid trackID required.");
+
+  const admin = serviceClient();
+  const track = await admin.from("music_tracks")
+    .select("id,release_id,owner_id")
+    .eq("id", trackID)
+    .maybeSingle();
+  if (track.error) throw track.error;
+  if (!track.data) return notFound();
+
+  const ownerID = String(track.data.owner_id ?? "").trim().toLowerCase();
+  if (!ownerID || !await canActAsAccount(authedID, ownerID)) return unauthorized();
+
+  const visibleTracks = await admin.from("music_tracks")
+    .select("id", { count: "exact", head: true })
+    .eq("release_id", track.data.release_id);
+  if (visibleTracks.error) throw visibleTracks.error;
+  if ((visibleTracks.count ?? 0) <= 1) {
+    return badRequest("A release must keep at least one song.");
+  }
+
+  const deleted = await admin.from("music_tracks")
+    .delete()
+    .eq("id", trackID)
+    .eq("owner_id", ownerID);
+  if (deleted.error) throw deleted.error;
+
+  const remaining = await admin.from("music_tracks")
+    .select("id,track_number")
+    .eq("release_id", track.data.release_id)
+    .order("track_number", { ascending: true });
+  if (remaining.error) throw remaining.error;
+  for (let index = 0; index < (remaining.data ?? []).length; index += 1) {
+    const row = remaining.data![index];
+    const trackNumber = index + 1;
+    if (row.track_number === trackNumber) continue;
+    const renumbered = await admin.from("music_tracks")
+      .update({ track_number: trackNumber })
+      .eq("id", row.id)
+      .eq("owner_id", ownerID);
+    if (renumbered.error) throw renumbered.error;
+  }
+  return json({ ok: true, trackID, releaseID: track.data.release_id });
+}
+
+async function deleteRelease(req: Request, authedID: string): Promise<Response> {
+  const payload = await req.json() as JsonRecord;
+  const releaseID = uuid(payload.releaseID ?? payload.release_id);
+  if (!releaseID) return badRequest("Valid releaseID required.");
+
+  const admin = serviceClient();
+  const release = await admin.from("music_releases")
+    .select("id,owner_id,scrolls_post_id")
+    .eq("id", releaseID)
+    .maybeSingle();
+  if (release.error) throw release.error;
+  if (!release.data) return notFound();
+
+  const ownerID = String(release.data.owner_id ?? "").trim().toLowerCase();
+  if (!ownerID || !await canActAsAccount(authedID, ownerID)) return unauthorized();
+
+  // Foreign keys cascade through tracks, assets, likes, library entries and
+  // play events. Storage is handled by the linked Scrolls post deletion or the
+  // orphan sweep, so this endpoint never accepts a caller-supplied object key.
+  const deleted = await admin.from("music_releases")
+    .delete()
+    .eq("id", releaseID)
+    .eq("owner_id", ownerID)
+    .select("id")
+    .maybeSingle();
+  if (deleted.error) throw deleted.error;
+  if (!deleted.data) return notFound();
+
+  return json({
+    ok: true,
+    releaseID,
+    scrollsPostID: release.data.scrolls_post_id ?? null,
+  });
+}
+
 async function releaseAnalytics(url: URL, ownerID: string): Promise<Response> {
   const releaseID = uuid(url.searchParams.get("releaseID") ?? url.searchParams.get("release_id"));
   if (!releaseID) return badRequest("Valid releaseID required.");
@@ -431,6 +548,97 @@ async function recordPlay(req: Request, userID: string | null): Promise<Response
     listener_hash: listenerHash,
     ms_played: acceptedMS,
     completed: durationMS > 0 && acceptedMS >= Math.round(durationMS * 0.9),
+    source,
+  });
+  if (inserted.error) {
+    if (inserted.error.code === "23505") return json({ counted: false, reason: "duplicate" });
+    throw inserted.error;
+  }
+
+  return json({ counted: true });
+}
+
+async function recordAdImpression(req: Request, userID: string | null): Promise<Response> {
+  const payload = await req.json() as JsonRecord;
+  const adID = uuid(payload.adID ?? payload.ad_id);
+  const sessionID = uuid(payload.sessionID ?? payload.session_id);
+  if (!adID || !sessionID) return badRequest("Valid adID and sessionID are required.");
+
+  const requestedMS = integerOrNull(payload.msPlayed ?? payload.ms_played);
+  if (requestedMS === null) return badRequest("msPlayed is required.");
+
+  const admin = serviceClient();
+  const adResult = await admin.from("music_ads")
+    .select("id,duration_seconds,is_active,starts_at,ends_at")
+    .eq("id", adID)
+    .maybeSingle();
+  if (adResult.error) throw adResult.error;
+  if (!adResult.data || !adResult.data.is_active) return notFound();
+
+  const durationSeconds = Number(adResult.data.duration_seconds ?? 0);
+  const durationMS = durationSeconds > 0 ? Math.round(durationSeconds * 1000) : 0;
+  const acceptedMS = Math.min(requestedMS, durationMS > 0 ? durationMS : 30 * 60 * 1000);
+  if (acceptedMS < 3_000) return json({ counted: false, reason: "listen-threshold" });
+
+  const now = Date.now();
+  const startsAt = adResult.data.starts_at ? new Date(adResult.data.starts_at).getTime() : null;
+  const endsAt = adResult.data.ends_at ? new Date(adResult.data.ends_at).getTime() : null;
+  const endGraceMS = durationMS > 0 ? durationMS : 5 * 60 * 1000;
+  if ((startsAt !== null && startsAt > now) || (endsAt !== null && endsAt + endGraceMS < now)) {
+    return notFound();
+  }
+
+  const listenerHash = await playListenerHash(req, userID);
+  const completed = durationMS > 0 && acceptedMS >= Math.round(durationMS * 0.9);
+  const existing = await admin.from("music_ad_impressions")
+    .select("id,listener_hash,ms_played,completed")
+    .eq("ad_id", adID)
+    .eq("session_id", sessionID)
+    .maybeSingle();
+  if (existing.error) throw existing.error;
+
+  if (existing.data) {
+    if (existing.data.listener_hash !== listenerHash) {
+      return json({ counted: false, reason: "duplicate" });
+    }
+    const nextMS = Math.max(Number(existing.data.ms_played ?? 0), acceptedMS);
+    const nextCompleted = Boolean(existing.data.completed) || completed;
+    if (nextMS === existing.data.ms_played && nextCompleted === existing.data.completed) {
+      return json({ counted: true, updated: false });
+    }
+    const updated = await admin.from("music_ad_impressions")
+      .update({ ms_played: nextMS, completed: nextCompleted })
+      .eq("id", existing.data.id);
+    if (updated.error) throw updated.error;
+    return json({ counted: true, updated: true });
+  }
+
+  const hourAgo = new Date(now - 60 * 60 * 1000).toISOString();
+  const dayAgo = new Date(now - 24 * 60 * 60 * 1000).toISOString();
+  const hourly = await admin.from("music_ad_impressions")
+    .select("id", { count: "exact", head: true })
+    .eq("listener_hash", listenerHash)
+    .gte("created_at", hourAgo);
+  if (hourly.error) throw hourly.error;
+  if ((hourly.count ?? 0) >= 30) return json({ counted: false, reason: "rate-limit" }, 429);
+
+  const sameAd = await admin.from("music_ad_impressions")
+    .select("id", { count: "exact", head: true })
+    .eq("listener_hash", listenerHash)
+    .eq("ad_id", adID)
+    .gte("created_at", dayAgo);
+  if (sameAd.error) throw sameAd.error;
+  if ((sameAd.count ?? 0) >= 3) return json({ counted: false, reason: "ad-rate-limit" });
+
+  const sourceRaw = String(payload.source ?? "web").trim().toLowerCase();
+  const source = PLAY_SOURCES.has(sourceRaw) ? sourceRaw : "web";
+  const inserted = await admin.from("music_ad_impressions").insert({
+    ad_id: adID,
+    user_id: userID,
+    session_id: sessionID,
+    listener_hash: listenerHash,
+    ms_played: acceptedMS,
+    completed,
     source,
   });
   if (inserted.error) {
