@@ -1470,6 +1470,7 @@ private struct CircleChatPane: View {
     @StateObject private var voiceRecorder = CircleVoiceRecorder()
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var photoSendErrorMessage: String?
+    @FocusState private var isComposerFocused: Bool
 
     private var isRateLimited: Bool {
         viewModel.isCircleMessageRateLimited(circleID: circle.id)
@@ -1483,6 +1484,10 @@ private struct CircleChatPane: View {
         "typing-\(circle.id.uuidString)"
     }
 
+    private var bottomAnchorID: String {
+        "circle-chat-bottom-\(circle.id.uuidString)"
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
@@ -1490,43 +1495,56 @@ private struct CircleChatPane: View {
                     LazyVStack(spacing: 10) {
                         ForEach(circle.messages) { message in
                             let profile = profileLookup(message.userID) ?? currentUser
-                        let sharedPost = message.sharedPostID.flatMap(postLookup)
-                        CircleChatBubble(
-                            message: message,
-                            circleID: circle.id,
-                            sender: profile,
-                            isCurrentUser: message.userID == currentUser.id,
-                            sharedPost: sharedPost,
-                            onShareTap: {
-                                if let sharedPost {
-                                    presentedSharedPost = sharedPost
+                            let sharedPost = message.sharedPostID.flatMap(postLookup)
+                            CircleChatBubble(
+                                message: message,
+                                circleID: circle.id,
+                                sender: profile,
+                                isCurrentUser: message.userID == currentUser.id,
+                                sharedPost: sharedPost,
+                                onShareTap: {
+                                    if let sharedPost {
+                                        presentedSharedPost = sharedPost
+                                    }
                                 }
-                            }
-                        )
-                        .id(message.id)
-                    }
+                            )
+                            .id(message.id)
+                        }
                         let typingParticipants = viewModel.typingParticipants(for: circle.id)
                         if !typingParticipants.isEmpty {
                             CircleTypingIndicatorBubble(participants: typingParticipants)
                                 .id(typingIndicatorID)
                                 .transition(.opacity.combined(with: .move(edge: .bottom)))
                         }
-                }
+                        Color.clear
+                            .frame(height: 1)
+                            .id(bottomAnchorID)
+                    }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
                 }
+                .scrollDismissesKeyboard(.interactively)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    isComposerFocused = false
+                }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .onChange(of: circle.messages.count) { _, _ in
-                    if let last = circle.messages.last {
-                        withAnimation {
-                            proxy.scrollTo(last.id, anchor: .bottom)
-                        }
+                    withAnimation {
+                        proxy.scrollTo(bottomAnchorID, anchor: .bottom)
                     }
                 }
                 .onChange(of: viewModel.typingParticipants(for: circle.id).count) { _, count in
                     guard count > 0 else { return }
                     withAnimation {
-                        proxy.scrollTo(typingIndicatorID, anchor: .bottom)
+                        proxy.scrollTo(bottomAnchorID, anchor: .bottom)
+                    }
+                }
+                .onChange(of: isComposerFocused) { _, _ in
+                    DispatchQueue.main.async {
+                        withAnimation {
+                            proxy.scrollTo(bottomAnchorID, anchor: .bottom)
+                        }
                     }
                 }
                 .onAppear {
@@ -1544,10 +1562,8 @@ private struct CircleChatPane: View {
                     // LazyVStack has a chance to lay out its rows before
                     // we ask the proxy to scroll — calling scrollTo on
                     // a not-yet-laid-out LazyVStack is a no-op.
-                    if let last = circle.messages.last {
-                        DispatchQueue.main.async {
-                            proxy.scrollTo(last.id, anchor: .bottom)
-                        }
+                    DispatchQueue.main.async {
+                        proxy.scrollTo(bottomAnchorID, anchor: .bottom)
                     }
                 }
                 .onDisappear {
@@ -1557,10 +1573,8 @@ private struct CircleChatPane: View {
                     // Switching between circles (without unmounting the
                     // view) should also re-anchor to the bottom of the new
                     // circle's chat history.
-                    if let last = circle.messages.last {
-                        DispatchQueue.main.async {
-                            proxy.scrollTo(last.id, anchor: .bottom)
-                        }
+                    DispatchQueue.main.async {
+                        proxy.scrollTo(bottomAnchorID, anchor: .bottom)
                     }
                 }
             }
@@ -1602,6 +1616,7 @@ private struct CircleChatPane: View {
                     TextField("Message the circle...", text: $messageDraft)
                         .textFieldStyle(.roundedBorder)
                         .frame(minHeight: 44)
+                        .focused($isComposerFocused)
                         .onChange(of: messageDraft) { _, newValue in
                             let max = viewModel.circleMessageCharacterLimit
                             if newValue.count > max {
